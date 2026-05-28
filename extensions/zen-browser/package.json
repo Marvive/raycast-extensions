@@ -17,7 +17,8 @@
     "pernielsentikaer",
     "Zheckan",
     "Diwanshumidha",
-    "vmrjnvc"
+    "vmrjnvc",
+    "gareth_price"
   ],
   "categories": [
     "Applications",
@@ -105,6 +106,10 @@
         {
           "title": "Qwant",
           "value": "Qwant"
+        },
+        {
+          "title": "Kagi",
+          "value": "Kagi"
         }
       ]
     },
@@ -254,7 +259,7 @@
   },
   "dependencies": {
     "@raycast/api": "^1.103.0",
-    "@raycast/utils": "^2.2.0"
+    "@raycast/utils": "^2.2.3"
   },
   "devDependencies": {
     "@types/sql.js": "1.4.4",
