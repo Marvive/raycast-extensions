@@ -1,22 +1,34 @@
 import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
+import { homedir } from "node:os";
 import { promisify } from "node:util";
 import { getPreferenceValues } from "@raycast/api";
 import {
+  CallView,
   Contact,
-  CurrentCall,
+  OngoingCall,
+  Room,
   StoredCall,
   TranscriptMatch,
   TupleError,
   TupleErrorKind,
-  TupleRooms,
-  TupleState,
+  TupleErrorPayload,
 } from "./types";
 
 const execFileAsync = promisify(execFile);
 
-/** Homebrew (Apple Silicon, then Intel) install locations, tried when no preference is set. */
-const FALLBACK_PATHS = ["/opt/homebrew/bin/tuple", "/usr/local/bin/tuple"];
+/**
+ * Where the `tuple` CLI lives, tried in order when no preference is set. The Tuple app's "Install
+ * CLI" integration symlinks the bundled binary to `/usr/local/bin/tuple`; if the user never ran it,
+ * fall back to the binary bundled inside the app itself (the CLI ships with the app — there is no
+ * Homebrew build), checking the system and user Applications folders.
+ */
+const BUNDLED_CLI = "Tuple.app/Contents/SharedSupport/bin/tuple";
+const FALLBACK_PATHS = [
+  "/usr/local/bin/tuple",
+  `/Applications/${BUNDLED_CLI}`,
+  `${homedir()}/Applications/${BUNDLED_CLI}`,
+];
 
 /**
  * Resolve the `tuple` executable. Raycast does not inherit the user's interactive shell
@@ -33,9 +45,9 @@ export function getBinaryPath(): string {
       return candidate;
     }
   }
-  // Nothing found — return the conventional default so the resulting ENOENT is classified
-  // as NotInstalled and surfaced with a helpful empty state.
-  return FALLBACK_PATHS[FALLBACK_PATHS.length - 1];
+  // Nothing found — return the canonical install location so the resulting ENOENT is classified
+  // as NotInstalled and the empty state points the user at the right place.
+  return FALLBACK_PATHS[0];
 }
 
 /**
@@ -55,16 +67,66 @@ export function jsonArgs(...args: string[]): string[] {
 /** Stderr fragments that mean the CLI couldn't reach the Tuple daemon (app not running). */
 const DAEMON_DOWN_SIGNALS = ["tuple.sock", "dial unix", "connection refused", "connect: no such file"];
 
+function fromPayload(payload: TupleErrorPayload): { kind: TupleErrorKind; message: string } | null {
+  const message = payload.error?.trim();
+  switch (payload.kind) {
+    case "contact_offline":
+      return { kind: TupleErrorKind.ContactOffline, message: message || "They’re offline." };
+    case "contact_busy":
+      return { kind: TupleErrorKind.ContactBusy, message: message || "They’re already on a call." };
+    case "invalid_call":
+      return { kind: TupleErrorKind.NotJoinable, message: message || "That call can’t be joined." };
+    case "conflict":
+      return {
+        kind: TupleErrorKind.AlreadyInCall,
+        message: message || "You’re already in a call. Hang up first, then join.",
+      };
+  }
+  // Older structured envelopes had an HTTP status but no stable kind.
+  if (payload.kind) {
+    return null;
+  }
+  switch (payload.error_code) {
+    case 409:
+      return { kind: TupleErrorKind.AlreadyInCall, message: "You’re already in a call. Hang up first, then join." };
+    case 410:
+      return { kind: TupleErrorKind.NoActiveCall, message: "No active call." };
+  }
+  return null;
+}
+
+/**
+ * Parse the JSON error envelope. Current CLIs write it to *stdout* under
+ * `--format json` — stderr stays empty — so the raw exec error carries it
+ * there. Anything that isn't a JSON object with an `error`/`kind` is not an
+ * envelope (an older CLI's prose, or a command run without `--format json`).
+ */
+function parseErrorPayload(stdout: string): TupleErrorPayload | null {
+  const text = stdout.trim();
+  if (!text.startsWith("{")) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(text) as TupleErrorPayload;
+    return typeof parsed?.error === "string" || typeof parsed?.kind === "string" ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
 /** Map any thrown exec error to a classified {@link TupleError}. */
 export function classifyError(error: unknown): TupleError {
   if (error instanceof TupleError) {
     return error;
   }
 
-  const err = error as { code?: string | number; message?: string; stderr?: string } | undefined;
+  const err = error as { code?: string | number; message?: string; stdout?: string; stderr?: string } | undefined;
+  const stdout = typeof err?.stdout === "string" ? err.stdout : "";
   const stderr = typeof err?.stderr === "string" ? err.stderr : "";
-  const haystack = `${err?.message ?? ""}\n${stderr}`.toLowerCase();
-  const detail = (stderr || err?.message || "").trim() || undefined;
+  // Commands asking for `--format json` report failures on stdout rather than
+  // stderr, so every signal below has to consider both streams.
+  const haystack = `${err?.message ?? ""}\n${stderr}\n${stdout}`.toLowerCase();
+  const detail = (stderr || stdout || err?.message || "").trim() || undefined;
 
   // Binary missing: spawn ENOENT, or a shell layer reporting "command not found".
   if (err?.code === "ENOENT" || haystack.includes("command not found")) {
@@ -75,9 +137,22 @@ export function classifyError(error: unknown): TupleError {
     );
   }
 
+  const payload = parseErrorPayload(stdout);
+  if (payload) {
+    const classified = fromPayload(payload);
+    if (classified) {
+      return new TupleError(classified.kind, classified.message, detail);
+    }
+  }
+
+  // Prose fallback, retained for CLIs predating the structured envelope.
   // Call-scoped command with no active call. Frequently a normal state (e.g. menu bar).
   if (haystack.includes("not in a call") || haystack.includes("no active call")) {
     return new TupleError(TupleErrorKind.NoActiveCall, "No active call.", detail);
+  }
+
+  if (haystack.includes("not on a joinable call")) {
+    return new TupleError(TupleErrorKind.NotJoinable, "That call can’t be joined.", detail);
   }
 
   // Joining while already in a call: the CLI returns 409 instead of switching you over.
@@ -150,77 +225,121 @@ export function parseJson<T>(stdout: string): T {
 }
 
 // --- Read wrappers -------------------------------------------------------------------
-// List/search reads are issued directly by the views via useTupleJson; getActiveCall is the
-// one read also needed imperatively (by the no-view mute toggle).
+// List/search reads are issued directly by the views via useTupleJson; getActiveCall and
+// listRooms are the reads also needed imperatively (the no-view mute toggle and the
+// join-personal-room command).
 
-export function getActiveCall(): Promise<CurrentCall> {
-  return runTupleJson<CurrentCall>(["call", "current"]);
+/** The active call as the normalized flat CallView. Throws NoActiveCall when not in a call. */
+export function getActiveCall(): Promise<CallView> {
+  return runTupleJson<CallView>(["call", "current"]);
 }
 
 export async function listContacts(): Promise<Contact[]> {
   return (await runTupleJson<Contact[]>(["contacts", "list"])) ?? [];
 }
 
-export function getState(): Promise<TupleState> {
-  return runTupleJson<TupleState>(["state"]);
+/** Ongoing calls, grouped and privacy-normalized by the CLI. */
+export async function listOngoingCalls(): Promise<OngoingCall[]> {
+  return (await runTupleJson<OngoingCall[]>(["call", "list"])) ?? [];
 }
 
-export async function getRooms(): Promise<TupleRooms> {
-  return (await getState()).rooms ?? {};
+/** List rooms as one flat, kind-tagged array. Extra args (e.g. "--kind", "personal") narrow the result. */
+export async function listRooms(...extraArgs: string[]): Promise<Room[]> {
+  return (await runTupleJson<Room[]>(["rooms", "list", ...extraArgs])) ?? [];
 }
 
 // --- Action wrappers -----------------------------------------------------------------
 // Contacts and call participants are addressed by email, which uniquely resolves a person
 // (partial names are ambiguous and the CLI rejects them).
 
-export async function startCall(email: string): Promise<void> {
-  await runTuple(["call", "start", email]);
+/**
+ * Run a mutating command and discard its output. It goes through JSON mode
+ * because that is what makes the CLI emit its `{error, error_code, kind}`
+ * envelope on failure; the reads that need human-readable text
+ * (`transcription show`, `connect --print`) keep calling {@link runTuple}.
+ */
+async function runTupleAction(args: string[]): Promise<void> {
+  await runTuple(jsonArgs(...args));
 }
 
-export async function addToCall(email: string): Promise<void> {
-  await runTuple(["call", "add", email]);
+function isUnsupportedFlag(error: unknown, flag: string): boolean {
+  const classified = classifyError(error);
+  return `${classified.message}\n${classified.detail ?? ""}`.toLowerCase().includes(`unknown flag: ${flag}`);
 }
 
-/** Join a call/room by person name or room URL/slug. */
-export async function joinCall(target: string): Promise<void> {
-  await runTuple(["call", "join", target]);
+async function runWithOptionalArgs<T>(
+  run: (args: string[]) => Promise<T>,
+  args: string[],
+  optionalArgs: string[],
+): Promise<T> {
+  try {
+    return await run([...args, ...optionalArgs]);
+  } catch (error) {
+    const unsupported = optionalArgs.find((arg) => arg.startsWith("--") && isUnsupportedFlag(error, arg));
+    if (!unsupported) {
+      throw error;
+    }
+    return run(args);
+  }
 }
 
-export async function setFavorite(email: string, favorited: boolean): Promise<void> {
-  await runTuple(["contacts", favorited ? "favorite" : "unfavorite", email]);
+async function runTupleActionWithFallback(args: string[], optionalArgs: string[]): Promise<void> {
+  await runWithOptionalArgs(runTupleAction, args, optionalArgs);
 }
 
-export async function muteCall(): Promise<void> {
-  await runTuple(["call", "mute"]);
+export function startCall(email: string): Promise<void> {
+  return runTupleActionWithFallback(["call", "start", email], ["--wait", "--timeout", "12s"]);
 }
 
-export async function unmuteCall(): Promise<void> {
-  await runTuple(["call", "unmute"]);
+export function addToCall(email: string): Promise<void> {
+  return runTupleActionWithFallback(["call", "add", email], ["--wait", "--timeout", "12s"]);
 }
 
-export async function hangUpCall(): Promise<void> {
-  await runTuple(["call", "hang-up"]);
+/** Join a call/room by person name or room URL/slug, switching from the current call when needed. */
+export function joinCall(target: string): Promise<void> {
+  return runTupleActionWithFallback(["call", "join", target], ["--switch"]);
 }
 
-export async function startTranscription(): Promise<void> {
-  await runTuple(["transcription", "start"]);
+export function setFavorite(email: string, favorited: boolean): Promise<void> {
+  return runTupleAction(["contacts", favorited ? "favorite" : "unfavorite", email]);
 }
 
-export async function stopTranscription(): Promise<void> {
-  await runTuple(["transcription", "stop"]);
+/** Favorite or unfavorite a room, addressed by its slug (the CLI also accepts the room URL). */
+export function setRoomFavorite(slug: string, favorited: boolean): Promise<void> {
+  return runTupleAction(["rooms", favorited ? "favorite" : "unfavorite", slug]);
 }
 
-export async function setCallTitle(callId: string, title: string): Promise<void> {
-  await runTuple(["transcription", "set-title", callId, title]);
+export function muteCall(): Promise<void> {
+  return runTupleAction(["call", "mute"]);
 }
 
-export async function setCallSummary(callId: string, summary: string): Promise<void> {
-  await runTuple(["transcription", "set-summary", callId, summary]);
+export function unmuteCall(): Promise<void> {
+  return runTupleAction(["call", "unmute"]);
+}
+
+export function hangUpCall(): Promise<void> {
+  return runTupleAction(["call", "hang-up"]);
+}
+
+export function startTranscription(): Promise<void> {
+  return runTupleAction(["transcription", "start"]);
+}
+
+export function stopTranscription(): Promise<void> {
+  return runTupleAction(["transcription", "stop"]);
+}
+
+export function setCallTitle(callId: string, title: string): Promise<void> {
+  return runTupleAction(["transcription", "set-title", callId, title]);
+}
+
+export function setCallSummary(callId: string, summary: string): Promise<void> {
+  return runTupleAction(["transcription", "set-summary", callId, summary]);
 }
 
 /** Permanently delete a stored call's transcript. Irreversible — confirm before calling. */
-export async function deleteTranscript(callId: string): Promise<void> {
-  await runTuple(["transcription", "delete", callId]);
+export function deleteTranscript(callId: string): Promise<void> {
+  return runTupleAction(["transcription", "delete", callId]);
 }
 
 /** Export one call (or all, when callId is omitted) to a directory. `transcription export` has no JSON mode. */
@@ -232,22 +351,36 @@ export async function exportTranscripts(directory: string, callId?: string): Pro
   await runTuple(args);
 }
 
-// The CLI's `transcription show` colorizes output with ANSI SGR codes (e.g. ESC[1;36m) even when not
-// a TTY, and NO_COLOR doesn't suppress them. Built without a literal control char to satisfy no-control-regex.
+// Built without a literal control char to satisfy no-control-regex.
 const ANSI_PATTERN = new RegExp(`${String.fromCharCode(27)}\\[[0-9;]*m`, "g");
 
-/** Strip the CLI's ANSI color codes so transcript text is clean for display, AI prompts, and AI tools. */
+/**
+ * Strip ANSI SGR color codes (e.g. ESC[1;36m) from CLI output. Current `tuple` builds emit clean,
+ * uncolored text from `transcription show` for non-TTY output, so this is defense-in-depth: the
+ * extension can be pointed at an older bundled CLI that still colorized regardless of TTY/NO_COLOR,
+ * and it keeps every consumer — display, AI prompts, AI tools — on plain text either way.
+ */
 export function stripAnsi(text: string): string {
   return text.replace(ANSI_PATTERN, "");
 }
 
 /**
- * Fetch a stored call's transcript as plain text (`transcription show`, default format), with the
- * CLI's ANSI color codes stripped so every consumer — including AI summarization and the
- * read-transcript tool — gets clean text rather than escape sequences.
+ * Fetch a stored call's transcript using the CLI's default timestamp format.
+ * ANSI codes are stripped defensively (see {@link stripAnsi}) so agent tools get
+ * clean text even from an older CLI that colorized its output.
  */
 export async function getTranscript(callId: string): Promise<string> {
   return stripAnsi(await runTuple(["transcription", "show", callId]));
+}
+
+/**
+ * Fetch compact transcript text for human display and title/summary generation.
+ * Current CLIs honor `--timestamps clock`; older CLIs already default to clocks
+ * and reach the same result through the optional-flag fallback.
+ */
+export async function getCompactTranscript(callId: string): Promise<string> {
+  const transcript = await runWithOptionalArgs(runTuple, ["transcription", "show", callId], ["--timestamps", "clock"]);
+  return stripAnsi(transcript);
 }
 
 /**
@@ -303,6 +436,11 @@ export function searchTranscriptSegments(
   }
 
   return emptyIfTranscriptionUnavailable(() => runTupleJson<TranscriptMatch[]>(args));
+}
+
+/** Remove the `[[...]]` match markers `transcription search` adds around matched terms. */
+export function stripMatchMarkers(text: string): string {
+  return text.replace(/\[\[|\]\]/g, "");
 }
 
 /**

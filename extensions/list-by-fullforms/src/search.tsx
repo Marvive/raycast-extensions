@@ -27,6 +27,14 @@
 //      to the entry detail modal; Enter on a list opens the list
 //      page.
 //
+// Empty-query state: a "Recently Added by You" section fills the view
+// with the caller's own newest entries via /api/v1/recent, workspace-
+// scoped by the same dropdown (rows are search-row-shaped since
+// list-repo migration 20261017000000, so EntrySearchRow renders them
+// unchanged, star toggle and all). When the caller has none (new
+// account, or nothing created since the web's created_by column
+// landed), the "Start typing to search" empty view shows as before.
+//
 // Detail-view toggle (Cmd+I, default ON): the panel opens with a
 // markdown preview of the selected entry on the right side — term +
 // type chip + short definition + long-form description, with the
@@ -43,12 +51,10 @@
 // helper in src/lib/listIconCatalog.ts (mirrored from
 // app/utils/listVisibility.js in the web app).
 //
-// TTS actions (Cmd+T / Cmd+Shift+T / Cmd+Opt+T on an entry row)
-// route through src/lib/tts.ts — Cmd+T speaks term + definition +
-// description (composeSpeakable joins them with [[slnc N]] pauses),
-// Cmd+Shift+T speaks just the definition, Cmd+Opt+T stops any in-
-// flight playback. See that module's header for the rate / voice /
-// shutdown-handler story.
+// The per-row surface (detail pane, star/edit/note/report actions,
+// copy actions, macOS-only TTS via src/lib/tts.ts) lives in
+// src/components/EntrySearchRow.tsx; this file owns fetching, grouping,
+// and the section scaffolding around those rows.
 
 import {
   Action,
@@ -60,32 +66,35 @@ import {
   showToast,
 } from "@raycast/api";
 import { useFetch } from "@raycast/utils";
+import type { MutatePromise } from "@raycast/utils";
 import { useEffect, useMemo, useState } from "react";
-import { apiBase, apiFetch, apiHost, authHeaders } from "./lib/api";
-import type { WorkspacesResponse } from "./lib/api";
-import { iconForList, listVisibility } from "./lib/listIconCatalog";
-import { composeSpeakable, speakText, stopSpeaking } from "./lib/tts";
+import {
+  apiBase,
+  apiFetch,
+  apiHost,
+  authHeaders,
+  errorMessage,
+  WRITABLE_ROLES,
+} from "./lib/api";
+import type {
+  WorkspacesResponse,
+  ListsResponse,
+  ListRow,
+  RecentEntriesResponse,
+  SearchEntryResult,
+  Workspace,
+} from "./lib/api";
+import {
+  iconForList,
+  iconForWorkspace,
+  listVisibility,
+} from "./lib/listIconCatalog";
+import { crossShortcut } from "./lib/platform";
+import { stopSpeaking } from "./lib/tts";
+import AddEntryCommand from "./add-entry";
+import { EntrySearchRow } from "./components/EntrySearchRow";
 
 const ALL_WORKSPACES = "all";
-
-// The Speak actions shell out to macOS's `say` binary (see
-// src/lib/tts.ts), which doesn't exist on Windows. The extension
-// ships for both platforms, so the TTS actions are gated to macOS
-// and simply don't render elsewhere. Everything else in this
-// command is cross-platform.
-const isMacOS = process.platform === "darwin";
-
-// Display labels for the entry `type` enum. Kept local because
-// this is the only command that surfaces a per-entry type label;
-// other commands either show the raw enum (Quick Add Entry's
-// dropdown items are labelled inside their TYPES array) or don't
-// surface the type at all.
-const TYPE_LABELS: Record<string, string> = {
-  term: "Term",
-  abbreviation: "Abbreviation",
-  word: "Word",
-  name: "Name",
-};
 
 interface SearchListResult {
   id: number;
@@ -97,25 +106,6 @@ interface SearchListResult {
   workspaceId: number;
   workspaceName: string;
   workspaceType: string;
-}
-
-interface SearchEntryResult {
-  id: number;
-  entry: string;
-  definition: string;
-  description: string;
-  type: string;
-  listId: number;
-  listName: string;
-  listIcon: string | null;
-  listColor: string | null;
-  listIsPublic: boolean;
-  workspaceId: number;
-  workspaceName: string;
-  workspaceType: string;
-  myNote: string | null;
-  isStarred: boolean;
-  tags: string[];
 }
 
 interface SearchResponse {
@@ -130,74 +120,6 @@ interface ListBucket {
   listColor: string | null;
   workspaceName: string;
   entries: SearchEntryResult[];
-}
-
-// Build the row-accessory array for an entry: a filled amber star
-// when the user has starred the entry, a document icon when they've
-// written a private note. Both render to the right of the row in
-// compact mode AND in detail mode (Raycast renders accessories
-// regardless of isShowingDetail), giving quick scan-time signals for
-// "I've already engaged with this entry". Tooltips on each accessory
-// make them discoverable without forcing a hover lookup. Returns
-// undefined when neither signal is on, so accessories are absent
-// from the row entirely (Raycast collapses the column width).
-function accessoriesForEntry(entry: SearchEntryResult) {
-  const items: {
-    icon: { source: Icon; tintColor?: string };
-    tooltip: string;
-  }[] = [];
-  if (entry.isStarred) {
-    items.push({
-      icon: { source: Icon.Star, tintColor: "#f59e0b" },
-      tooltip: "Starred",
-    });
-  }
-  if (entry.myNote && entry.myNote.trim()) {
-    items.push({
-      icon: { source: Icon.Document },
-      tooltip: "You have a private note",
-    });
-  }
-  return items.length > 0 ? items : undefined;
-}
-
-// Compose the detail markdown for an entry: H2 term, type+definition
-// line, then the long-form description (if any), then the caller's
-// private note (if any) under a "Your note" header. Plain markdown so
-// Raycast renders it natively — callout prefixes like "> Example: …"
-// render as visual blockquotes for free, since the on-disk format
-// is already markdown-style. Mention links were stripped server-side
-// (migration 20260602000000) so links to "#123" don't sneak in. The
-// note section is added last because it's the most caller-specific
-// piece — the entry's own content above is shared with every reader
-// of the list, the note is yours alone.
-function entryDetailMarkdown(entry: SearchEntryResult): string {
-  const lines: string[] = [];
-  // Star glyph rides alongside the term in the H2 when starred, so
-  // the visual signal sits at the top of the detail pane (mirroring
-  // the star button at the top-right of the web's entry detail
-  // modal) — replaces the previous "Starred: Yes" metadata row which
-  // read as dry metadata rather than a status indicator.
-  lines.push(`## ${entry.entry}${entry.isStarred ? " ⭐" : ""}`);
-  lines.push("");
-  if (entry.definition) {
-    lines.push(entry.definition);
-  }
-  if (entry.description && entry.description.trim()) {
-    lines.push("");
-    lines.push("---");
-    lines.push("");
-    lines.push(entry.description);
-  }
-  if (entry.myNote && entry.myNote.trim()) {
-    lines.push("");
-    lines.push("---");
-    lines.push("");
-    lines.push("### Your note");
-    lines.push("");
-    lines.push(entry.myNote);
-  }
-  return lines.join("\n");
 }
 
 export default function SearchCommand() {
@@ -233,6 +155,37 @@ export default function SearchCommand() {
 
   const workspaces = workspacesQuery.data?.workspaces ?? [];
 
+  // Look up a workspace by id so each result row can show its avatar
+  // beside the workspace name in the detail pane. The /api/v1/search
+  // rows don't carry avatar_url, but the workspaces fetch above already
+  // has it for every workspace the caller belongs to (which is every
+  // workspace a result can come from), so we resolve it client-side
+  // rather than widening the search response.
+  const workspacesById = useMemo(() => {
+    const map = new Map<number, Workspace>();
+    for (const w of workspaces) map.set(w.id, w);
+    return map;
+  }, [workspaces]);
+
+  // Fetch the caller's lists once so we can (a) gate the "Edit Entry"
+  // action to lists the caller can write to, and (b) hand the list's
+  // tag catalog to the edit form's tag picker. Non-fatal on error: if
+  // this fails the Edit action just stays hidden and the read-only /
+  // note actions still work. Notes need only read access, so the note
+  // action never depends on this fetch.
+  const listsQuery = useFetch<ListsResponse>(`${apiBase()}/api/v1/lists`, {
+    headers: authHeaders(),
+    onError: () => {},
+  });
+
+  const listsById = useMemo(() => {
+    const map = new Map<number, ListRow>();
+    for (const l of listsQuery.data?.lists ?? []) {
+      map.set(l.id, l);
+    }
+    return map;
+  }, [listsQuery.data]);
+
   const trimmed = query.trim();
   const isAll = workspaceId === ALL_WORKSPACES;
   const searchUrl = isAll
@@ -252,10 +205,54 @@ export default function SearchCommand() {
     },
   });
 
+  // Recently Added: the caller's own newest entries, filling the
+  // empty-query state instead of a bare "start typing" screen. Backed
+  // by /api/v1/recent (list-repo migration 20261017000000 widened its
+  // rows to the search-row shape precisely so EntrySearchRow renders
+  // them unchanged). The workspace dropdown scopes it exactly like
+  // search does. Only fetched while the query is empty; a non-empty
+  // query hands the view over to search. Errors degrade silently to
+  // the plain empty state: the workspaces fetch above already toasts
+  // the launch-time failure modes (bad token, server down), and a
+  // second toast for a decorative section would be noise.
+  const recentUrl = isAll
+    ? `${apiBase()}/api/v1/recent?limit=10`
+    : `${apiBase()}/api/v1/recent?limit=10&workspace_id=${workspaceId}`;
+
+  // NO keepPreviousData here, deliberately, unlike the search fetch
+  // above. That flag keeps the prior arguments' results on screen while
+  // a new request lands, which is right for search (the URL changes on
+  // every keystroke, so dropping data mid-type would flicker the whole
+  // list). This query's URL changes on exactly ONE event: a workspace
+  // switch. Keeping the previous data there would render the OLD
+  // workspace's entries under the NEW workspace selection, and since
+  // these rows carry live star / edit / note / report actions, the user
+  // could act on rows that aren't in the scope they're looking at.
+  // Without the flag, a switch to a workspace not yet loaded this
+  // session shows the loading state instead (isLoading covers it), and
+  // the two common paths stay flicker-free anyway because useFetch
+  // caches per arguments: clearing the search bar re-reads the same URL
+  // from cache, as does returning to a workspace viewed earlier.
+  const recentQuery = useFetch<RecentEntriesResponse>(recentUrl, {
+    headers: authHeaders(),
+    execute: !trimmed,
+    onError: () => {},
+  });
+
+  // Array.isArray guard per the house convention: useFetch's cache
+  // persists between command runs, so the first paint after a server
+  // redeploy can briefly serve a cached pre-migration shape.
+  const recentEntries =
+    !trimmed && Array.isArray(recentQuery.data?.entries)
+      ? recentQuery.data.entries
+      : [];
+
   const entries = searchQuery.data?.entries ?? [];
   const lists = searchQuery.data?.lists ?? [];
   const isLoading =
-    workspacesQuery.isLoading || (!!trimmed && searchQuery.isLoading);
+    workspacesQuery.isLoading ||
+    (!!trimmed && searchQuery.isLoading) ||
+    (!trimmed && recentQuery.isLoading);
 
   // Group entries by listId so each parent list owns a Section. Map
   // preserves insertion order, so sections appear in the order entries
@@ -299,7 +296,7 @@ export default function SearchCommand() {
     <Action
       title={showingDetail ? "Hide Detail" : "Show Detail"}
       icon={Icon.AppWindowSidebarRight}
-      shortcut={{ modifiers: ["cmd"], key: "i" }}
+      shortcut={crossShortcut(["cmd"], "i")}
       onAction={() => setShowingDetail((v) => !v)}
     />
   );
@@ -310,16 +307,25 @@ export default function SearchCommand() {
   // round-trip. The mutate's optimisticUpdate runs synchronously
   // before the network call lands; if the API errors, mutate rolls
   // the local state back automatically and we surface a toast.
-  const toggleEntryStar = async (entry: SearchEntryResult) => {
+  // Generic over the response shape because two fetches host
+  // starrable rows: the search results and the Recently Added
+  // section. Each call site passes its own query's mutate.
+  const toggleEntryStar = async <T extends { entries: SearchEntryResult[] }>(
+    entry: SearchEntryResult,
+    mutate: MutatePromise<T | undefined>,
+  ) => {
     const willBeStarred = !entry.isStarred;
     try {
-      await searchQuery.mutate(
+      await mutate(
         apiFetch(`/api/v1/entries/${entry.id}/star`, {
           method: willBeStarred ? "POST" : "DELETE",
         }),
         {
           optimisticUpdate(current) {
             if (!current) return current;
+            // Cast because TS can't prove a spread-with-override
+            // still satisfies an arbitrary T; only `entries` is
+            // swapped, so it does.
             return {
               ...current,
               entries: current.entries.map((row) =>
@@ -327,7 +333,7 @@ export default function SearchCommand() {
                   ? { ...row, isStarred: willBeStarred }
                   : row,
               ),
-            };
+            } as T;
           },
         },
       );
@@ -336,11 +342,10 @@ export default function SearchCommand() {
         title: willBeStarred ? "Starred" : "Unstarred",
       });
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
       await showToast({
         style: Toast.Style.Failure,
         title: willBeStarred ? "Could not star" : "Could not unstar",
-        message,
+        message: errorMessage(error),
       });
     }
   };
@@ -351,7 +356,10 @@ export default function SearchCommand() {
       searchText={query}
       onSearchTextChange={setQuery}
       throttle
-      isShowingDetail={showingDetail && entries.length + lists.length > 0}
+      isShowingDetail={
+        showingDetail &&
+        (trimmed ? entries.length + lists.length > 0 : recentEntries.length > 0)
+      }
       searchBarPlaceholder="Search entries and lists…"
       searchBarAccessory={
         workspaces.length > 1 ? (
@@ -371,6 +379,7 @@ export default function SearchCommand() {
                   key={w.id}
                   title={w.name}
                   value={String(w.id)}
+                  icon={iconForWorkspace(w.avatar_url, w.type)}
                 />
               ))}
             </List.Dropdown.Section>
@@ -378,45 +387,134 @@ export default function SearchCommand() {
         ) : undefined
       }
     >
-      {entriesByList.map((bucket) => (
+      {/* Empty-query state: the caller's own newest entries, flat and
+          newest-first rather than grouped by list, because recency IS
+          the ordering claim and grouping would scramble it. The header
+          says "by You" on purpose: the endpoint filters on
+          created_by = caller (there is no updated_by column to widen
+          it), so on a shared team glossary this is your additions,
+          not an activity feed. Gated on !trimmed so the two modes
+          never mix; the search sections below are gated the same way
+          in reverse, which also stops keepPreviousData's stale rows
+          from lingering after the query is cleared. */}
+      {!trimmed && recentEntries.length > 0 && (
         <List.Section
-          key={`list-section-${bucket.listId}`}
-          title={
-            showWorkspaceInHeader
-              ? `${bucket.listName} · ${bucket.workspaceName}`
-              : bucket.listName
-          }
-          subtitle={String(bucket.entries.length)}
+          title="Recently Added by You"
+          subtitle={String(recentEntries.length)}
         >
-          {bucket.entries.map((e) => {
-            const vis = listVisibility(e.listIsPublic, e.workspaceType);
+          {recentEntries.map((e) => {
+            // Same Edit gate as the search rows: writable role on the
+            // entry's list, from the lists fetch. Recent entries are
+            // the caller's own creations so this is nearly always
+            // true, but a demotion to viewer since creating one isn't.
+            const editableList = listsById.get(e.listId);
+            const canEdit =
+              !!editableList && WRITABLE_ROLES.has(editableList.effective_role);
+            return (
+              <EntrySearchRow
+                key={`recent-${e.id}`}
+                entry={e}
+                listIcon={e.listIcon}
+                listColor={e.listColor}
+                workspaceAvatarUrl={
+                  workspacesById.get(e.workspaceId)?.avatar_url ?? null
+                }
+                showingDetail={showingDetail}
+                detailToggleAction={toggleDetailAction}
+                canEdit={canEdit}
+                listTags={
+                  editableList && Array.isArray(editableList.tags)
+                    ? editableList.tags
+                    : []
+                }
+                onToggleStar={() => toggleEntryStar(e, recentQuery.mutate)}
+                onMutated={() => recentQuery.revalidate()}
+              />
+            );
+          })}
+        </List.Section>
+      )}
+
+      {!!trimmed &&
+        entriesByList.map((bucket) => (
+          <List.Section
+            key={`list-section-${bucket.listId}`}
+            title={
+              showWorkspaceInHeader
+                ? `${bucket.listName} · ${bucket.workspaceName}`
+                : bucket.listName
+            }
+            subtitle={String(bucket.entries.length)}
+          >
+            {bucket.entries.map((e) => {
+              // Gate "Edit Entry" on the caller's role for this entry's
+              // list (from the lists fetch). Absent while lists load, or
+              // for a public list the caller only favorited (viewer) →
+              // no Edit action.
+              const editableList = listsById.get(e.listId);
+              const canEdit =
+                !!editableList &&
+                WRITABLE_ROLES.has(editableList.effective_role);
+              return (
+                <EntrySearchRow
+                  key={`entry-${e.id}`}
+                  entry={e}
+                  listIcon={bucket.listIcon}
+                  listColor={bucket.listColor}
+                  workspaceAvatarUrl={
+                    workspacesById.get(e.workspaceId)?.avatar_url ?? null
+                  }
+                  showingDetail={showingDetail}
+                  detailToggleAction={toggleDetailAction}
+                  canEdit={canEdit}
+                  listTags={
+                    editableList && Array.isArray(editableList.tags)
+                      ? editableList.tags
+                      : []
+                  }
+                  onToggleStar={() => toggleEntryStar(e, searchQuery.mutate)}
+                  onMutated={() => searchQuery.revalidate()}
+                />
+              );
+            })}
+          </List.Section>
+        ))}
+
+      {!!trimmed && (
+        <List.Section title="Lists" subtitle={String(lists.length)}>
+          {lists.map((l) => {
+            const vis = listVisibility(l.isPublic, l.workspaceType);
             return (
               <List.Item
-                key={`entry-${e.id}`}
-                icon={iconForList(bucket.listIcon, bucket.listColor)}
-                title={e.entry}
-                subtitle={showingDetail ? undefined : e.definition}
-                accessories={accessoriesForEntry(e)}
+                key={`list-${l.id}`}
+                icon={iconForList({
+                  icon: l.icon,
+                  color: l.color,
+                  name: l.name,
+                  id: l.id,
+                })}
+                title={l.name}
+                subtitle={showingDetail ? undefined : (l.description ?? "")}
+                accessories={
+                  showWorkspaceInHeader && !showingDetail
+                    ? [{ text: l.workspaceName }]
+                    : undefined
+                }
                 detail={
                   <List.Item.Detail
-                    markdown={entryDetailMarkdown(e)}
+                    markdown={[
+                      `## ${l.name}`,
+                      "",
+                      l.description ? l.description : "_No description._",
+                    ].join("\n")}
                     metadata={
                       <List.Item.Detail.Metadata>
                         <List.Item.Detail.Metadata.Link
                           title="Open"
                           text={apiHost()}
-                          target={`${apiBase()}/${e.listId}#${e.id}`}
+                          target={`${apiBase()}/${l.id}`}
                         />
                         <List.Item.Detail.Metadata.Separator />
-                        <List.Item.Detail.Metadata.Label
-                          title="Type"
-                          text={TYPE_LABELS[e.type] ?? e.type}
-                        />
-                        <List.Item.Detail.Metadata.Label
-                          title="List"
-                          text={e.listName}
-                          icon={iconForList(e.listIcon, e.listColor)}
-                        />
                         <List.Item.Detail.Metadata.Label
                           title="Visibility"
                           text={vis.label}
@@ -424,18 +522,8 @@ export default function SearchCommand() {
                         />
                         <List.Item.Detail.Metadata.Label
                           title="Workspace"
-                          text={e.workspaceName}
+                          text={l.workspaceName}
                         />
-                        {Array.isArray(e.tags) && e.tags.length > 0 && (
-                          <List.Item.Detail.Metadata.TagList title="Tags">
-                            {e.tags.map((tag) => (
-                              <List.Item.Detail.Metadata.TagList.Item
-                                key={tag}
-                                text={tag}
-                              />
-                            ))}
-                          </List.Item.Detail.Metadata.TagList>
-                        )}
                       </List.Item.Detail.Metadata>
                     }
                   />
@@ -443,155 +531,43 @@ export default function SearchCommand() {
                 actions={
                   <ActionPanel>
                     <Action.OpenInBrowser
-                      title="Open Entry"
-                      url={`${apiBase()}/${e.listId}#${e.id}`}
-                    />
-                    <Action.OpenInBrowser
                       title="Open List"
-                      url={`${apiBase()}/${e.listId}`}
-                      shortcut={{ modifiers: ["cmd", "shift"], key: "o" }}
-                    />
-                    <Action
-                      title={e.isStarred ? "Unstar Entry" : "Star Entry"}
-                      icon={
-                        e.isStarred
-                          ? Icon.StarDisabled
-                          : { source: Icon.Star, tintColor: "#f59e0b" }
-                      }
-                      shortcut={{ modifiers: ["cmd"], key: "s" }}
-                      onAction={() => toggleEntryStar(e)}
+                      url={`${apiBase()}/${l.id}`}
                     />
                     {toggleDetailAction}
-                    <Action.CopyToClipboard
-                      title="Copy Term"
-                      content={e.entry}
-                    />
-                    <Action.CopyToClipboard
-                      title="Copy Definition"
-                      content={e.definition}
-                      shortcut={{ modifiers: ["cmd"], key: "." }}
-                    />
-                    {/* TTS via macOS's built-in `say`. Two granularities:
-                      Cmd+T speaks the full payload (term + definition +
-                      description) which is the accessibility / glance-
-                      replacement case, and Cmd+Shift+T speaks just the
-                      definition which is useful when the user can
-                      already see the term but wants to hear the
-                      explanation without parsing it visually (or while
-                      multitasking). speakText kills the previous
-                      playback before starting a new one so the two
-                      actions don't overlap. macOS-only: `say` has no
-                      Windows equivalent, so these actions are gated out
-                      on Windows rather than failing at runtime. */}
-                    {isMacOS && (
-                      <>
-                        <Action
-                          title="Speak Entry"
-                          icon={Icon.SpeakerHigh}
-                          shortcut={{ modifiers: ["cmd"], key: "t" }}
-                          onAction={() =>
-                            speakText(
-                              composeSpeakable(
-                                e.entry,
-                                e.definition,
-                                e.description,
-                              ),
-                            )
-                          }
-                        />
-                        <Action
-                          title="Speak Definition"
-                          icon={Icon.SpeakerHigh}
-                          shortcut={{ modifiers: ["cmd", "shift"], key: "t" }}
-                          onAction={() => speakText(e.definition)}
-                        />
-                        <Action
-                          title="Stop Speaking"
-                          icon={Icon.SpeakerOff}
-                          shortcut={{ modifiers: ["cmd", "opt"], key: "t" }}
-                          onAction={stopSpeaking}
-                        />
-                      </>
-                    )}
                   </ActionPanel>
                 }
               />
             );
           })}
         </List.Section>
-      ))}
-
-      <List.Section
-        title="Lists"
-        subtitle={trimmed ? String(lists.length) : undefined}
-      >
-        {lists.map((l) => {
-          const vis = listVisibility(l.isPublic, l.workspaceType);
-          return (
-            <List.Item
-              key={`list-${l.id}`}
-              icon={iconForList(l.icon, l.color)}
-              title={l.name}
-              subtitle={showingDetail ? undefined : (l.description ?? "")}
-              accessories={
-                showWorkspaceInHeader && !showingDetail
-                  ? [{ text: l.workspaceName }]
-                  : undefined
-              }
-              detail={
-                <List.Item.Detail
-                  markdown={[
-                    `## ${l.name}`,
-                    "",
-                    l.description ? l.description : "_No description._",
-                  ].join("\n")}
-                  metadata={
-                    <List.Item.Detail.Metadata>
-                      <List.Item.Detail.Metadata.Link
-                        title="Open"
-                        text={apiHost()}
-                        target={`${apiBase()}/${l.id}`}
-                      />
-                      <List.Item.Detail.Metadata.Separator />
-                      <List.Item.Detail.Metadata.Label
-                        title="Visibility"
-                        text={vis.label}
-                        icon={vis.icon}
-                      />
-                      <List.Item.Detail.Metadata.Label
-                        title="Workspace"
-                        text={l.workspaceName}
-                      />
-                    </List.Item.Detail.Metadata>
-                  }
-                />
-              }
-              actions={
-                <ActionPanel>
-                  <Action.OpenInBrowser
-                    title="Open List"
-                    url={`${apiBase()}/${l.id}`}
-                  />
-                  {toggleDetailAction}
-                </ActionPanel>
-              }
-            />
-          );
-        })}
-      </List.Section>
+      )}
 
       <List.EmptyView
         icon={Icon.MagnifyingGlass}
         title={trimmed ? "No matches" : "Start typing to search"}
         description={
           trimmed
-            ? "Try a different term, or pick another workspace."
+            ? "Nothing here yet. Press Enter to add it, or pick another workspace."
             : workspaces.length
               ? `Searching ${activeWorkspaceName}.`
               : "Loading workspaces…"
         }
         actions={
           <ActionPanel>
+            {/* Offer to create the missing entry right from the "No
+                matches" state, pre-filled with the search term. Pushes
+                the Quick Add Entry form onto the nav stack so the user
+                stays in this window (Esc pops back to the search); the
+                term rides along via AddEntryCommand's initialEntry prop.
+                Only when there's an actual query to seed the form. */}
+            {trimmed && (
+              <Action.Push
+                title={`Add "${trimmed}" as a New Entry`}
+                icon={Icon.Plus}
+                target={<AddEntryCommand initialEntry={trimmed} />}
+              />
+            )}
             {toggleDetailAction}
             <Action
               title="Open Preferences"

@@ -1,5 +1,5 @@
-import { getRooms } from "../lib/tuple";
-import { Room } from "../lib/types";
+import { listRooms } from "../lib/tuple";
+import { primaryPersonalRoom, Room } from "../lib/types";
 
 /**
  * List Tuple rooms (personal and team) with who is currently in each. Rooms are persistent named
@@ -7,21 +7,31 @@ import { Room } from "../lib/types";
  * Engineering room?" and "which rooms have someone in them right now?".
  */
 export default async function () {
-  const rooms = await getRooms();
+  // `tuple rooms list` returns one flat, kind-tagged array; split it back into personal/team. The
+  // CLI's default count cap applies — an agent answering "which rooms have someone in them?" doesn't
+  // need an unbounded dump that floods the model's context on large teams.
+  const [rooms, personalRooms] = await Promise.all([listRooms(), listRooms("--kind", "personal", "--limit", "-1")]);
+  const primaryRoom = primaryPersonalRoom(personalRooms);
+  const visiblePersonalRooms = rooms.filter((room) => room.kind === "personal");
+  if (primaryRoom && !visiblePersonalRooms.some((room) => room.slug === primaryRoom.slug)) {
+    visiblePersonalRooms.unshift(primaryRoom);
+  }
   return {
-    personal: (rooms.personal ?? []).map(describeRoom),
-    team: (rooms.team ?? []).map(describeRoom),
+    personal: visiblePersonalRooms.map((room) => describeRoom(room, room.slug === primaryRoom?.slug)),
+    team: rooms.filter((room) => room.kind === "team").map((room) => describeRoom(room, false)),
   };
 }
 
-function describeRoom(room: Room) {
+function describeRoom(room: Room, primary: boolean) {
   return {
-    name: room.name?.trim() || "Personal Room",
+    name: room.name.trim() || "Personal Room",
     slug: room.slug,
     url: room.http_value,
-    favorited: Boolean(room.favorited),
-    occupants: (room.members ?? [])
-      .map((member) => member.full_name ?? member.short_name ?? member.email)
-      .filter((name): name is string => Boolean(name)),
+    favorited: room.favorited,
+    primary,
+    createdAt: room.created_at || undefined,
+    // True when the user's current call is in this room — lets an agent answer "which room am I in?".
+    activeCall: room.active_call,
+    occupants: room.members.map((member) => member.full_name || member.email).filter(Boolean),
   };
 }

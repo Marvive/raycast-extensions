@@ -39,6 +39,12 @@ export interface Workspace {
   // Caller's role within the workspace — 'owner', 'admin',
   // 'editor', or 'viewer'.
   role: string;
+  // Full public URL of the workspace avatar, or null when none is set.
+  // Returned by /api/v1/workspaces (api_workspaces_for_token, snake_case
+  // straight off the RPC). Optional in the type so a cached
+  // pre-widening response doesn't break callers; iconForWorkspace falls
+  // back to a type glyph when it's absent.
+  avatar_url?: string | null;
 }
 
 export interface Tag {
@@ -66,12 +72,69 @@ export interface ListRow {
   tags: Tag[];
 }
 
+// Roles that grant write access to a list's entries, matching the
+// server's can_edit_list gate (owner / admin / editor; viewer is
+// read-only). Quick Add Entry filters its list picker to these, and the
+// Search command gates the per-row "Edit Entry" action on them. Shared
+// here so the set can't drift between those two call sites.
+export const WRITABLE_ROLES = new Set(["owner", "admin", "editor"]);
+
 export interface WorkspacesResponse {
   workspaces: Workspace[];
 }
 
 export interface ListsResponse {
   lists: ListRow[];
+}
+
+// One entry row from /api/v1/search (api_search_for_token). Lives here
+// rather than in search.tsx because the shape is shared: the Search
+// command consumes it for grouping/fetching and EntrySearchRow renders
+// it. camelCase because that's what the RPC's jsonb_build_object emits.
+// Field provenance: description + type (migration 20260602000000),
+// myNote + isStarred (20260603000000), tags (20260605000000),
+// listIsPublic + workspaceType (20260606000000).
+export interface SearchEntryResult {
+  id: number;
+  entry: string;
+  definition: string;
+  description: string;
+  // The description exactly as stored, mention tokens ([label](#id))
+  // intact, from list-repo migration 20261018000000. `description`
+  // above is the mention-STRIPPED display copy; render that one, but
+  // EDIT this one: the edit form must round-trip the raw text or
+  // saving an edit silently rewrites every mention token to its bare
+  // label. Optional because a cached pre-migration response can lack
+  // it across a server deploy; editors fall back to `description`.
+  descriptionRaw?: string;
+  type: string;
+  listId: number;
+  listName: string;
+  listIcon: string | null;
+  listColor: string | null;
+  listIsPublic: boolean;
+  workspaceId: number;
+  workspaceName: string;
+  workspaceType: string;
+  myNote: string | null;
+  isStarred: boolean;
+  tags: string[];
+}
+
+// One entry row from /api/v1/recent (api_recent_entries_for_token):
+// the caller's own most-recently-created entries, newest first. Since
+// list-repo migration 20261017000000 the row is the full search-row
+// shape plus createdAt, deliberately, so the Search command's
+// "Recently Added" empty-query section can render these through
+// EntrySearchRow with no re-joining. If SearchEntryResult widens
+// again, the recent RPC must follow (it copies the search RPC's field
+// expressions verbatim).
+export interface RecentEntryResult extends SearchEntryResult {
+  createdAt: string;
+}
+
+export interface RecentEntriesResponse {
+  entries: RecentEntryResult[];
 }
 
 const DEFAULT_BASE = "https://list.fullforms.com";
@@ -119,7 +182,7 @@ export async function apiFetch<T>(
 
   if (res.status === 401) {
     throw new Error(
-      "Token invalid or revoked. Open extension preferences and paste a fresh one from list.fullforms.com/account.",
+      "Token invalid or revoked. Open extension preferences and paste a fresh one from list.fullforms.com/account?token_client=raycast.",
     );
   }
   if (res.status === 429) {
@@ -161,6 +224,14 @@ async function readErrorMessage(res: Response): Promise<string> {
     // not JSON; fall through to the raw text
   }
   return text;
+}
+
+// Normalize an unknown caught value to a display string for toast
+// `message` slots. The catch-arm idiom `error instanceof Error ?
+// error.message : String(error)` was copy-pasted nine times across the
+// commands before being centralised here.
+export function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 // Thrown for any non-canned non-ok response. Carries the HTTP status
